@@ -20,6 +20,7 @@ A comprehensive guide to application design based on deep analysis of the Fizzy 
 12. [What They Deliberately Avoid](#what-they-deliberately-avoid)
 13. [Naming Conventions](#naming-conventions)
 14. [Product Design Inferences](#product-design-inferences)
+15. [Code Evolution Patterns](#code-evolution-patterns)
 
 ---
 
@@ -1514,6 +1515,153 @@ No Redis means:
 
 ---
 
+## Code Evolution Patterns
+
+Analysis of the git history reveals how 37signals code evolves over time.
+
+### Tests Ship With Features (Not TDD, Not Afterthought)
+
+Tests are included in the same commit as features. Not strict TDD, but tests aren't added later either:
+
+```
+commit fa118a7 - "Add validation for the join code usage limit"
+  app/models/account/join_code.rb                         |  3 +++
+  app/controllers/account/join_codes_controller.rb        |  7 +++++--
+  test/controllers/accounts/join_codes_controller_test.rb | 10 ++++++++++
+```
+
+The commit message focuses on the feature, but the test is there.
+
+### Security Fixes Include Regression Tests
+
+```ruby
+# commit 83360ec - "Escape the names used to generate system comments"
+
+# The fix:
+def creator_name
+  h event.creator.name  # ERB::Util.h for escaping
+end
+
+# The test (same commit):
+test "escapes html in comment body" do
+  users(:david).update! name: "<em>Injected</em>"
+  @card.toggle_assignment users(:kevin)
+
+  comment = @card.comments.last
+  html = comment.body.body.to_html
+  assert_includes html, "&lt;em&gt;Injected&lt;/em&gt;"  # Escaped!
+  refute_includes html, "<em>Injected</em>"              # Not raw!
+end
+```
+
+### Large Features Are Comprehensive
+
+The storage tracking feature (commit 761d0b4) shipped with:
+- 11 new model/concern files
+- 2 jobs
+- 2 migrations
+- 7 test files with 1015+ lines of tests
+
+All in one commit. Features ship complete.
+
+### Refactoring Is Incremental
+
+Logic gets moved to better locations over time:
+
+```ruby
+# Before: Controller concern checking environment
+module SetTenant
+  def single_tenant?
+    ENV.fetch("SINGLE_TENANT", "false") == "true"
+  end
+end
+
+# After: Model concern with class method
+module MultiTenant
+  class_methods do
+    def accepting_signups?
+      ENV.fetch("MULTI_TENANT", "true") == "true" || Account.none?
+    end
+  end
+end
+```
+
+The pattern: **Start simple, extract when patterns emerge**.
+
+### Consistency Refactors
+
+When a pattern is established, older code gets updated to match:
+
+```ruby
+# commit 5cfe693 - "Change reaction admin permission check to be in-line with other controllers"
+
+# Before: Inline permission check
+def destroy
+  @reaction = @comment.reactions.find(params[:id])
+  if Current.user != @reaction.reacter
+    head :forbidden
+  else
+    @reaction.destroy
+  end
+end
+
+# After: Matches pattern from other controllers
+before_action :set_reaction, only: [:destroy]
+before_action :ensure_permision_to_administer_reaction, only: [:destroy]
+
+def destroy
+  @reaction.destroy
+end
+
+private
+  def set_reaction
+    @reaction = @comment.reactions.find(params[:id])
+  end
+
+  def ensure_permision_to_administer_reaction
+    head :forbidden if Current.user != @reaction.reacter
+  end
+```
+
+### Commit Message Patterns
+
+Commit messages are concise and focus on the "what":
+
+- `Add validation for the join code usage limit`
+- `Escape the names used to generate system comments`
+- `Wrap join code redemption in a lock`
+- `Remove redundant include`
+- `Refactor: use idiomatic .last instead of .order(:desc).first`
+
+Not:
+- ~~`[FIZZY-1234] Add validation for join code usage limit to prevent integer overflow errors when users enter extremely large numbers`~~
+
+### Bug Fixes Are Small
+
+Race condition fix (commit c8a5d01) touched 1 file, 2 lines:
+
+```ruby
+# Before
+def redeem_if(&block)
+  yield if redeemable?
+end
+
+# After
+def redeem_if(&block)
+  with_lock { yield if redeemable? }
+end
+```
+
+### What This Tells Us
+
+1. **Ship complete features** - Code + tests + migrations in one commit
+2. **Refactor toward consistency** - When you establish a pattern, update old code
+3. **Keep fixes small** - Bug fixes should be surgical
+4. **Tests prove the fix** - Security/bug fixes include regression tests
+5. **Start simple, extract later** - Don't over-engineer upfront
+
+---
+
 ## Summary: The 37signals Way
 
 1. **Start with vanilla Rails** - Don't add abstractions until you feel the pain
@@ -1526,5 +1674,7 @@ No Redis means:
 8. **Database is king** - No Redis, no Elasticsearch
 9. **Test with fixtures** - Deterministic, fast, simple
 10. **Ship incrementally** - Commit history shows many small changes
+11. **Tests ship with features** - Not TDD, not afterthought, but together
+12. **Refactor toward consistency** - Establish patterns, then update old code
 
 The best code is the code you don't write. The second best is the code that's obviously correct. The 37signals codebase optimizes for both.
