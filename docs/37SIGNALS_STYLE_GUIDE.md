@@ -1569,16 +1569,30 @@ end
 ```ruby
 module CurrentTimezone
   included do
-    etag { timezone_from_cookie }  # Different timezone = different cache
+    etag { timezone_from_cookie }
   end
 end
 
 module Authentication
   included do
-    etag { Current.identity.id if authenticated? }  # Different user = different cache
+    etag { Current.identity.id if authenticated? }
   end
 end
 ```
+
+**Why timezone affects caching:**
+
+Pages display times like "Created 2 hours ago" or "Dec 14, 3:00 PM". These are rendered server-side in the user's timezone (via `Time.use_zone`). If you cache the HTML and serve it to everyone:
+
+- User in NYC sees "3:00 PM" ✓
+- User in London gets same cached response, sees "3:00 PM" ✗ (should be "8:00 PM")
+
+By including timezone in the ETag:
+1. NYC user gets ETag `"abc123-America/New_York"`
+2. London user's `If-None-Match` doesn't match → gets fresh response
+3. Each timezone gets its own cached version
+
+Same logic for `Current.identity.id` - personalized content ("You commented...") can't be shared across users.
 
 ### Complex ETags
 
