@@ -2343,6 +2343,411 @@ end
 
 ---
 
+## Reusable Stimulus Controllers Catalog
+
+These controllers are generic enough to copy into any Rails project. They demonstrate 37signals' approach: small, focused, dependency-free utilities.
+
+### Copy-to-Clipboard Controller (25 lines)
+
+Simple async clipboard API wrapper with visual feedback:
+
+```javascript
+// app/javascript/controllers/copy_to_clipboard_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static values = { content: String }
+  static classes = [ "success" ]
+
+  async copy(event) {
+    event.preventDefault()
+    this.reset()
+
+    try {
+      await navigator.clipboard.writeText(this.contentValue)
+      this.element.classList.add(this.successClass)
+    } catch {}
+  }
+
+  reset() {
+    this.element.classList.remove(this.successClass)
+    this.#forceReflow()
+  }
+
+  #forceReflow() {
+    this.element.offsetWidth
+  }
+}
+```
+
+Usage:
+```html
+<button data-controller="copy-to-clipboard"
+        data-copy-to-clipboard-content-value="https://example.com/share"
+        data-copy-to-clipboard-success-class="copied"
+        data-action="click->copy-to-clipboard#copy">
+  Copy Link
+</button>
+```
+
+### Auto-Click Controller (7 lines)
+
+Clicks an element when it connects. Perfect for auto-submitting forms or auto-focusing:
+
+```javascript
+// app/javascript/controllers/auto_click_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  connect() {
+    this.element.click()
+  }
+}
+```
+
+Usage: `<button data-controller="auto-click" data-action="...">` - triggers on page load.
+
+### Element Removal Controller (7 lines)
+
+Removes any element on action:
+
+```javascript
+// app/javascript/controllers/element_removal_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  remove() {
+    this.element.remove()
+  }
+}
+```
+
+Usage: `<div data-controller="element-removal"><button data-action="element-removal#remove">Dismiss</button></div>`
+
+### Toggle Class Controller (31 lines)
+
+Toggle, add, or remove CSS classes:
+
+```javascript
+// app/javascript/controllers/toggle_class_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static classes = [ "toggle" ]
+  static targets = [ "checkbox" ]
+
+  toggle() {
+    this.element.classList.toggle(this.toggleClass)
+  }
+
+  add() {
+    this.element.classList.add(this.toggleClass)
+  }
+
+  remove() {
+    this.element.classList.remove(this.toggleClass)
+  }
+
+  checkAll() {
+    this.checkboxTargets.forEach(checkbox => checkbox.checked = true)
+  }
+
+  checkNone() {
+    this.checkboxTargets.forEach(checkbox => checkbox.checked = false)
+  }
+}
+```
+
+### Auto-Resize Controller (32 lines)
+
+Auto-expands textareas as you type:
+
+```javascript
+// app/javascript/controllers/autoresize_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static values = { minHeight: { type: Number, default: 0 } }
+
+  connect() { this.resize() }
+
+  resize() {
+    this.element.style.height = "auto"
+    const newHeight = Math.max(this.minHeightValue, this.element.scrollHeight)
+    this.element.style.height = `${newHeight}px`
+  }
+
+  reset() {
+    this.element.style.height = "auto"
+  }
+}
+```
+
+Usage:
+```html
+<textarea data-controller="autoresize"
+          data-autoresize-min-height-value="100"
+          data-action="input->autoresize#resize"></textarea>
+```
+
+### Hotkey Controller (25 lines)
+
+Bind keyboard shortcuts to elements:
+
+```javascript
+// app/javascript/controllers/hotkey_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  click(event) {
+    if (this.#isClickable && !this.#shouldIgnore(event)) {
+      event.preventDefault()
+      this.element.click()
+    }
+  }
+
+  focus(event) {
+    if (this.#isClickable && !this.#shouldIgnore(event)) {
+      event.preventDefault()
+      this.element.focus()
+    }
+  }
+
+  #shouldIgnore(event) {
+    return event.defaultPrevented || event.target.closest("input, textarea, lexxy-editor")
+  }
+
+  get #isClickable() {
+    return getComputedStyle(this.element).pointerEvents !== "none"
+  }
+}
+```
+
+Usage: `<button data-controller="hotkey" data-action="keydown.n@window->hotkey#click">New Card (N)</button>`
+
+### Local Time Controller (55 lines)
+
+Format UTC timestamps in the user's timezone:
+
+```javascript
+// app/javascript/controllers/local_time_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static values = {
+    datetime: String,
+    format: { type: String, default: "time-or-date" }
+  }
+
+  connect() { this.render() }
+
+  render() {
+    const datetime = new Date(this.datetimeValue)
+    const formattedDate = this.#format(datetime)
+    this.element.textContent = formattedDate
+  }
+
+  #format(datetime) {
+    const now = new Date()
+    const isToday = datetime.toDateString() === now.toDateString()
+
+    switch (this.formatValue) {
+      case "time-or-date":
+        return isToday ? this.#formatTime(datetime) : this.#formatDate(datetime)
+      case "time":
+        return this.#formatTime(datetime)
+      case "date":
+        return this.#formatDate(datetime)
+      default:
+        return datetime.toLocaleString()
+    }
+  }
+
+  #formatTime(datetime) {
+    return datetime.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+  }
+
+  #formatDate(datetime) {
+    return datetime.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+  }
+}
+```
+
+### Fetch on Visible Controller (28 lines)
+
+Lazy load content when element scrolls into view:
+
+```javascript
+// app/javascript/controllers/fetch_on_visible_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static values = { url: String, threshold: { type: Number, default: 0.1 } }
+
+  connect() {
+    this.observer = new IntersectionObserver(
+      entries => entries.forEach(entry => { if (entry.isIntersecting) this.fetch() }),
+      { threshold: this.thresholdValue }
+    )
+    this.observer.observe(this.element)
+  }
+
+  disconnect() {
+    this.observer?.disconnect()
+  }
+
+  async fetch() {
+    this.observer.disconnect()
+    const response = await fetch(this.urlValue)
+    this.element.innerHTML = await response.text()
+  }
+}
+```
+
+### Dialog Controller (64 lines)
+
+Native HTML `<dialog>` management with modal/non-modal support:
+
+```javascript
+// app/javascript/controllers/dialog_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static targets = [ "dialog" ]
+  static values = { modal: { type: Boolean, default: false } }
+
+  connect() {
+    this.dialogTarget.setAttribute("aria-hidden", "true")
+  }
+
+  open() {
+    if (this.modalValue) {
+      this.dialogTarget.showModal()
+    } else {
+      this.dialogTarget.show()
+    }
+    this.dialogTarget.setAttribute("aria-hidden", "false")
+    this.dispatch("show")
+  }
+
+  toggle() {
+    this.dialogTarget.open ? this.close() : this.open()
+  }
+
+  close() {
+    this.dialogTarget.close()
+    this.dialogTarget.setAttribute("aria-hidden", "true")
+    this.dispatch("close")
+  }
+
+  closeOnClickOutside({ target }) {
+    if (!this.element.contains(target)) this.close()
+  }
+}
+```
+
+### Lightbox Controller (35 lines)
+
+Simple image lightbox using native `<dialog>`:
+
+```javascript
+// app/javascript/controllers/lightbox_controller.js
+import { Controller } from "@hotwired/stimulus"
+
+export default class extends Controller {
+  static targets = [ "caption", "dialog", "zoomedImage" ]
+
+  open(event) {
+    this.dialogTarget.showModal()
+    this.#set(event.target.closest("a"))
+  }
+
+  handleTransitionEnd(event) {
+    if (event.target === this.dialogTarget && !this.dialogTarget.open) {
+      this.reset()
+    }
+  }
+
+  reset() {
+    this.zoomedImageTarget.src = ""
+    this.captionTarget.innerText = ""
+  }
+
+  #set(target) {
+    this.zoomedImageTarget.src = target.href
+    const caption = target.dataset.lightboxCaptionValue
+    if (caption) this.captionTarget.innerText = caption
+  }
+}
+```
+
+### Navigable List Controller (258 lines)
+
+Full keyboard navigation for lists - arrow keys, enter to select, nested lists:
+
+Key features:
+- Arrow key navigation (configurable vertical/horizontal)
+- Enter to activate items
+- Auto-scroll to keep selection visible
+- Nested list support
+- ARIA-compliant (aria-selected, aria-activedescendant)
+
+Too long to include inline, but essential for any accessible list UI.
+
+### Local Save Controller (59 lines)
+
+Auto-save form content to localStorage, restore on page load:
+
+```javascript
+// Key features:
+// - Debounced saves (300ms)
+// - Clears on successful submit
+// - Restores content on page load
+// - Unique key per form
+
+static values = { key: String }
+
+save() {
+  const content = this.inputTarget.value
+  if (content) {
+    localStorage.setItem(this.keyValue, content)
+  } else {
+    localStorage.removeItem(this.keyValue)
+  }
+}
+
+submit({ detail: { success } }) {
+  if (success) localStorage.removeItem(this.keyValue)
+}
+```
+
+### Form Controller (92 lines)
+
+Form utilities including:
+- Debounced submission
+- IME composition handling (for CJK input)
+- Input validation before submit
+- Duplicate submission prevention
+
+### Drag and Drop Controller (150 lines)
+
+Full drag-and-drop between containers with:
+- Counter updates
+- CSS variable transfer (for visual feedback)
+- Turbo Stream integration
+- Automatic position management
+
+### Key Patterns Across All Controllers
+
+1. **Stimulus Values for Configuration** - Not data attributes parsed manually
+2. **Stimulus Classes for Styling** - CSS classes are configurable
+3. **Dispatch for Communication** - `this.dispatch("show")` lets parent controllers listen
+4. **Private Methods with #** - Modern JS private fields
+5. **Early Returns** - `if (!condition) return` for guard clauses
+6. **No Dependencies** - Vanilla JS, no jQuery, no utilities
+
+---
+
 ## Summary: The 37signals Way
 
 1. **Start with vanilla Rails** - Don't add abstractions until you feel the pain
