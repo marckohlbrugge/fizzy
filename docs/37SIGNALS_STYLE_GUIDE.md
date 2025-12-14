@@ -3200,6 +3200,78 @@ Models automatically generate cache keys via `cache_key_with_version`:
 cache card  # => "cards/abc123-20241214120000"
 ```
 
+### Cache Invalidation via `touch: true`
+
+Instead of granular cache keys, they use `touch: true` extensively (16 associations):
+
+```ruby
+# When a comment is created, card.updated_at changes → card cache invalidates
+belongs_to :card, touch: true    # Comment, Step, Closure, Assignment, Watch
+belongs_to :board, touch: true   # Column, Access
+belongs_to :comment, touch: true # Reaction
+```
+
+This is intentionally simple:
+- **Accept the cache churn** - cards change often anyway
+- **No Russian doll complexity** - whole card cached, not nested fragments
+- **Predictable invalidation** - any child change busts parent cache
+
+### Avatar Caching (Redirect-Based URLs)
+
+Avatars use a redirect pattern for HTTP caching:
+
+```ruby
+# app/controllers/users/avatars_controller.rb
+def show
+  if @user.avatar.attached?
+    # Redirect to blob URL (which has its own caching)
+    redirect_to rails_blob_url(@user.avatar_thumbnail, disposition: "inline")
+  elsif stale? @user, cache_control: cache_control
+    # Render SVG initials, cached via ETags
+    render_initials
+  end
+end
+
+def cache_control
+  if @user == Current.user
+    {}  # No caching for your own avatar (might change it)
+  else
+    { max_age: 30.minutes, stale_while_revalidate: 1.week }
+  end
+end
+```
+
+Avatar variants are pre-processed on upload:
+
+```ruby
+# app/models/user/avatar.rb
+has_one_attached :avatar do |attachable|
+  attachable.variant :thumb, resize_to_fill: [256, 256], process: :immediately
+end
+```
+
+### Dynamic SVG with ERB (`.svg.erb`)
+
+Initials are rendered as SVG - a neat trick using Rails view rendering:
+
+```erb
+<%# app/views/users/avatars/show.svg.erb %>
+<svg viewBox="0 0 512 512" class="avatar" aria-hidden="true">
+  <rect width="100%" height="100%" rx="50"
+        fill="<%= avatar_background_color(@user) %>" />
+  <text x="50%" y="50%" fill="#FFFFFF" text-anchor="middle" dy="0.35em"
+        font-size="230" font-weight="800">
+    <%= @user.initials %>
+  </text>
+</svg>
+```
+
+Benefits:
+- **Cacheable** - HTTP caching works (ETags from user record)
+- **Dynamic** - Color computed from user ID via CRC32
+- **No image processing** - pure vector graphics
+- **Accessible** - `aria-hidden` since avatar is decorative
+
 ---
 
 ## Scope Naming Conventions
