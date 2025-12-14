@@ -31,6 +31,16 @@ A comprehensive guide to application design based on deep analysis of the Fizzy 
 23. [Configuration & Environment](#configuration--environment)
 24. [Mailer Patterns](#mailer-patterns)
 25. [Code Evolution Patterns](#code-evolution-patterns)
+26. [Reusable Stimulus Controllers Catalog](#reusable-stimulus-controllers-catalog)
+27. [CSS Architecture](#css-architecture-modern-layered-no-preprocessors)
+28. [View Helpers](#view-helpers-stimulus-integrated-components)
+29. [Fragment Caching Patterns](#fragment-caching-patterns)
+30. [Scope Naming Conventions](#scope-naming-conventions)
+31. [PWA & Push Notifications](#pwa--push-notifications)
+32. [Notable Gems They DO Use](#notable-gems-they-do-use)
+33. [Model Callbacks](#model-callbacks-used-sparingly)
+34. [CSP Configuration](#csp-configuration-extensible-via-env)
+35. [Summary](#summary-the-37signals-way)
 
 ---
 
@@ -3073,6 +3083,329 @@ Minimal breakpoints, mostly fluid:
 5. **Utilities are escape hatches** - Not the primary approach
 6. **Progressive enhancement** - `@supports` for new features
 7. **Minimal responsive** - Fluid over breakpoint-heavy
+
+---
+
+## View Helpers: Stimulus-Integrated Components
+
+Helpers wrap Stimulus controllers for reusable UI patterns:
+
+### Icon Helper
+
+```ruby
+# app/helpers/application_helper.rb
+def icon_tag(name, **options)
+  tag.span class: class_names("icon icon--#{name}", options.delete(:class)),
+           "aria-hidden": true, **options
+end
+```
+
+Usage: `<%= icon_tag("arrow-left") %>`
+
+### Clipboard Helper
+
+```ruby
+# app/helpers/clipboard_helper.rb
+def button_to_copy_to_clipboard(url, &)
+  tag.button class: "btn", data: {
+    controller: "copy-to-clipboard tooltip",
+    action: "copy-to-clipboard#copy",
+    copy_to_clipboard_success_class: "btn--success",
+    copy_to_clipboard_content_value: url
+  }, &
+end
+```
+
+### Auto-Submit Form Helper
+
+```ruby
+# app/helpers/forms_helper.rb
+def auto_submit_form_with(**attributes, &)
+  data = attributes.delete(:data) || {}
+  data[:controller] = "auto-submit #{data[:controller]}".strip
+
+  form_with **attributes, data: data, &
+end
+```
+
+### Avatar Helper (Deterministic Colors)
+
+```ruby
+# app/helpers/avatars_helper.rb
+AVATAR_COLORS = %w[#AF2E1B #CC6324 #3B4B59 ...]
+
+def avatar_background_color(user)
+  # Same user always gets same color via CRC32 hash
+  AVATAR_COLORS[Zlib.crc32(user.to_param) % AVATAR_COLORS.size]
+end
+
+def avatar_tag(user, hidden_for_screen_reader: false, **options)
+  link_to user_path(user),
+    class: class_names("avatar btn btn--circle", options.delete(:class)),
+    data: { turbo_frame: "_top" },
+    aria: { hidden: hidden_for_screen_reader, label: user.name } do
+    avatar_image_tag(user)
+  end
+end
+```
+
+### Back Link Helper
+
+```ruby
+def back_link_to(label, url, action, **options)
+  link_to url, class: "btn btn--back",
+    data: { controller: "hotkey", action: action }, **options do
+    icon_tag("arrow-left") +
+    tag.strong("Back to #{label}", class: "overflow-ellipsis") +
+    tag.kbd("ESC", class: "txt-x-small hide-on-touch")
+  end
+end
+```
+
+---
+
+## Fragment Caching Patterns
+
+### Basic Fragment Cache
+
+```erb
+<%# app/views/cards/_container.html.erb %>
+<% cache card do %>
+  <%= render "cards/card", card: card %>
+<% end %>
+```
+
+### Collection Caching
+
+```erb
+<%# Automatic cache key per item, cached: true enables collection caching %>
+<%= render partial: "cards/comments/comment",
+           collection: card.comments.preloaded.chronologically,
+           cached: true %>
+```
+
+### Turbo Cache Exemptions
+
+```erb
+<%# Pages that shouldn't be restored from Turbo's page cache %>
+<% turbo_exempts_page_from_cache %>
+```
+
+### Model Cache Keys
+
+Models automatically generate cache keys via `cache_key_with_version`:
+
+```ruby
+# Card includes updated_at, so cache invalidates on any change
+cache card  # => "cards/abc123-20241214120000"
+```
+
+---
+
+## Scope Naming Conventions
+
+### Ordering Scopes
+
+```ruby
+scope :chronologically,         -> { order created_at: :asc }
+scope :reverse_chronologically, -> { order created_at: :desc }
+scope :alphabetically,          -> { order name: :asc }
+scope :latest,                  -> { order last_active_at: :desc }
+```
+
+### Preloading Scopes
+
+Use `preloaded` as a standard name for eager loading:
+
+```ruby
+# app/models/card.rb
+scope :with_users, -> {
+  preload(creator: [:avatar_attachment, :account],
+          assignees: [:avatar_attachment, :account])
+}
+
+scope :preloaded, -> {
+  with_users
+    .preload(:column, :tags, :steps, :closure, :goldness, :activity_spike,
+             :image_attachment, board: [:entropy, :columns], not_now: [:user])
+    .with_rich_text_description_and_embeds
+}
+```
+
+```ruby
+# app/models/comment.rb
+scope :preloaded, -> { with_rich_text_body.includes(reactions: :reacter) }
+```
+
+```ruby
+# app/models/notification.rb
+scope :preloaded, -> {
+  preload(:creator, :account,
+          source: [:board, :creator, { eventable: [:closure, :board, :assignments] }])
+}
+```
+
+### Parameterized Scopes
+
+```ruby
+scope :indexed_by, ->(index) do
+  case index.to_s
+  when "all"      then all
+  when "closed"   then closed
+  when "open"     then open
+  when "not_now"  then not_now
+  else all
+  end
+end
+
+scope :sorted_by, ->(sort) do
+  case sort.to_s
+  when "latest"   then latest
+  when "oldest"   then chronologically
+  else latest
+  end
+end
+```
+
+---
+
+## PWA & Push Notifications
+
+### Minimal Service Worker
+
+```javascript
+// app/views/pwa/service_worker.js
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return
+
+  if (event.request.destination === 'document') {
+    event.respondWith(
+      fetch(event.request, { cache: 'no-cache' })
+        .catch(() => caches.match(event.request))  // Offline fallback
+    )
+  }
+})
+
+// Push notifications
+self.addEventListener("push", async (event) => {
+  const data = await event.data.json()
+  event.waitUntil(Promise.all([
+    showNotification(data),
+    updateBadgeCount(data.options)
+  ]))
+})
+
+// App badge count
+async function updateBadgeCount({ data: { badge } }) {
+  return self.navigator.setAppBadge?.(badge || 0)
+}
+
+// Notification click opens app
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close()
+  const url = new URL(event.notification.data.path, self.location.origin).href
+  event.waitUntil(openURL(url))
+})
+```
+
+### Web Push Gem
+
+Uses `web-push` gem for server-side push:
+
+```ruby
+# Gemfile
+gem "web-push"
+```
+
+---
+
+## Notable Gems They DO Use
+
+While avoiding heavyweight dependencies, these gems made the cut:
+
+| Gem | Purpose |
+|-----|---------|
+| `geared_pagination` | DHH's cursor-based pagination |
+| `propshaft` | Asset pipeline (simpler than Sprockets) |
+| `solid_queue` | Database-backed job queue |
+| `solid_cache` | Database-backed Rails cache |
+| `solid_cable` | Database-backed Action Cable |
+| `thruster` | HTTP/2 proxy for Puma |
+| `kamal` | Docker deployment |
+| `redcarpet` + `rouge` | Markdown + syntax highlighting |
+| `rqrcode` | QR code generation |
+| `lexxy` | Rich text editor (Basecamp's) |
+| `platform_agent` | User agent parsing |
+| `web-push` | Push notifications |
+| `mission_control-jobs` | Job monitoring UI |
+| `autotuner` | Automatic Ruby GC tuning |
+
+### What's NOT in the Gemfile
+
+- No `devise` (custom auth)
+- No `pundit`/`cancancan` (simple role checks)
+- No `sidekiq` (Solid Queue)
+- No `redis` (database for everything)
+- No `elasticsearch` (custom sharded search)
+- No `view_component` (partials + helpers)
+- No `dry-rb` anything
+- No `interactor`/`trailblazer` (no service objects)
+
+---
+
+## Model Callbacks: Used Sparingly
+
+Only **38 callback occurrences across 30 files** - callbacks are used but not overused:
+
+### Common Callback Uses
+
+```ruby
+# After commit for async work
+after_commit :relay_later, on: :create
+
+# Before save for derived data
+before_save :set_defaults
+
+# After create for side effects
+after_create_commit :broadcast_new_record
+```
+
+### What They Avoid
+
+- No complex callback chains
+- No `before_validation` for business logic
+- No callbacks that call external services synchronously
+- Prefer explicit method calls over implicit callbacks
+
+---
+
+## CSP Configuration: Extensible via ENV
+
+```ruby
+# config/initializers/content_security_policy.rb
+
+# Helper to get additional CSP sources from ENV or config.x
+sources = ->(directive) do
+  env_key = "CSP_#{directive.to_s.upcase}"
+  value = if ENV.key?(env_key)
+    ENV[env_key]
+  else
+    config.x.content_security_policy.send(directive)
+  end
+  # Supports: nil, string, space-separated string, or array
+  case value
+  when nil then []
+  when Array then value
+  when String then value.split
+  else []
+  end
+end
+```
+
+This allows:
+- Base CSP defined in code
+- Extensions via ENV vars (`CSP_SCRIPT_SRC="https://cdn.example.com"`)
+- Config overrides for multi-tenant SaaS
 
 ---
 
