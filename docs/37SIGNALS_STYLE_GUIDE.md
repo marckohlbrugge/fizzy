@@ -20,7 +20,17 @@ A comprehensive guide to application design based on deep analysis of the Fizzy 
 12. [What They Deliberately Avoid](#what-they-deliberately-avoid)
 13. [Naming Conventions](#naming-conventions)
 14. [Product Design Inferences](#product-design-inferences)
-15. [Code Evolution Patterns](#code-evolution-patterns)
+15. [HTTP Caching Patterns](#http-caching-patterns)
+16. [Multi-Tenancy Deep Dive](#multi-tenancy-deep-dive)
+17. [Database Patterns](#database-patterns)
+18. [Stimulus Controller Patterns](#stimulus-controller-patterns)
+19. [Event Tracking & Activity System](#event-tracking--activity-system)
+20. [PORO Patterns](#poro-patterns-plain-old-ruby-objects)
+21. [API Design Patterns](#api-design-patterns)
+22. [Error Handling & Validation](#error-handling--validation)
+23. [Configuration & Environment](#configuration--environment)
+24. [Mailer Patterns](#mailer-patterns)
+25. [Code Evolution Patterns](#code-evolution-patterns)
 
 ---
 
@@ -1512,6 +1522,663 @@ No Redis means:
 - One fewer infrastructure component
 - Transactions work across jobs/cache/websockets
 - Simpler backup/restore
+
+---
+
+## HTTP Caching Patterns
+
+37signals uses HTTP caching extensively via ETags and conditional GET requests.
+
+### `fresh_when` for Conditional GET
+
+Controllers declare cache dependencies with `fresh_when`:
+
+```ruby
+class Cards::AssignmentsController < ApplicationController
+  def new
+    @assigned_to = @card.assignees.active.alphabetically
+    @users = @board.users.active.alphabetically.where.not(id: @card.assignees)
+    fresh_when etag: [@users, @card.assignees]  # Returns 304 if unchanged
+  end
+end
+
+class Cards::WatchesController < ApplicationController
+  def show
+    fresh_when etag: @card.watch_for(Current.user) || "none"
+  end
+end
+
+class Boards::ColumnsController < ApplicationController
+  def show
+    set_page_and_extract_portion_from @column.cards.active.latest
+    fresh_when etag: @page.records
+  end
+end
+```
+
+### Global ETags in ApplicationController
+
+```ruby
+class ApplicationController < ActionController::Base
+  etag { "v1" }  # Bump to bust all caches on deploy
+end
+```
+
+### Concern-Level ETags
+
+```ruby
+module CurrentTimezone
+  included do
+    etag { timezone_from_cookie }  # Different timezone = different cache
+  end
+end
+
+module Authentication
+  included do
+    etag { Current.identity.id if authenticated? }  # Different user = different cache
+  end
+end
+```
+
+### Complex ETags
+
+```ruby
+fresh_when etag: [@board, @page.records, @user_filtering]
+fresh_when etag: [@filters, @boards, @tags, @users]
+```
+
+---
+
+## Multi-Tenancy Deep Dive
+
+URL-based multi-tenancy: `/{account_id}/boards/...`
+
+### The Middleware Pattern
+
+```ruby
+# config/initializers/tenanting/account_slug.rb
+module AccountSlug
+  PATTERN = /(\d{7,})/  # 7+ digit account IDs
+  PATH_INFO_MATCH = /\A(\/#{AccountSlug::PATTERN})/
+
+  class Extractor
+    def call(env)
+      request = ActionDispatch::Request.new(env)
+
+      if request.path_info =~ PATH_INFO_MATCH
+        # Move /{account_id} from PATH_INFO to SCRIPT_NAME
+        # Rails thinks it's "mounted" at this path
+        request.engine_script_name = request.script_name = $1
+        request.path_info = $'.empty? ? "/" : $'
+        env["fizzy.external_account_id"] = $2.to_i
+      end
+
+      if env["fizzy.external_account_id"]
+        account = Account.find_by(external_account_id: env["fizzy.external_account_id"])
+        Current.with_account(account) { @app.call env }
+      else
+        Current.without_account { @app.call env }
+      end
+    end
+  end
+end
+```
+
+**Benefits:**
+- No subdomain DNS complexity
+- Deep links work naturally
+- `Current.account` available everywhere
+- URL helpers auto-include account prefix
+
+---
+
+## Database Patterns
+
+### UUIDs Everywhere
+
+```ruby
+create_table "cards", id: :uuid do |t|
+  t.uuid "account_id", null: false
+  t.uuid "board_id", null: false
+  t.uuid "creator_id", null: false
+end
+```
+
+### Every Model Has `account_id`
+
+```ruby
+class Comment < ApplicationRecord
+  belongs_to :account, default: -> { card.account }
+end
+```
+
+### No Foreign Keys
+
+Constraints removed for flexibility:
+
+```ruby
+class RemoveAllForeignKeyConstraints < ActiveRecord::Migration[8.2]
+  def change
+    # All foreign keys removed
+  end
+end
+```
+
+### Simple Migrations
+
+```ruby
+class AddPurposeToMagicLinks < ActiveRecord::Migration[8.2]
+  def change
+    add_column :magic_links, :purpose, :string, default: "sign_in"
+  end
+end
+```
+
+---
+
+## Stimulus Controller Patterns
+
+52 controllers split: **62% reusable, 38% domain-specific**.
+
+### Reusable/Generic Controllers
+
+```javascript
+// toggle_class_controller.js
+export default class extends Controller {
+  static classes = ["toggle"]
+  toggle() { this.element.classList.toggle(this.toggleClass) }
+}
+
+// copy_to_clipboard_controller.js
+export default class extends Controller {
+  static values = { content: String }
+  async copy(e) {
+    e.preventDefault()
+    await navigator.clipboard.writeText(this.contentValue)
+  }
+}
+```
+
+### Domain-Specific Controllers
+
+```javascript
+// drag_and_drop_controller.js
+export default class extends Controller {
+  static targets = ["item", "container"]
+  static classes = ["draggedItem", "hoverContainer"]
+
+  async drop(event) {
+    const container = this.#containerContaining(event.target)
+    await this.#submitDropRequest(this.dragItem, container)
+  }
+}
+```
+
+### Design Rules
+
+1. **Single responsibility** - One behavior per controller
+2. **Configuration via values/classes** - `static values`, `static classes`
+3. **Events for communication** - `this.dispatch("show")`
+4. **Private methods with `#`** - `this.#handleSubmitEnd()`
+5. **Small file size** - Most under 50 lines
+
+---
+
+## Event Tracking & Activity System
+
+### The Event Model
+
+Events are the single source of truth for activity:
+
+```ruby
+class Event < ApplicationRecord
+  include Notifiable, Particulars, Promptable
+
+  belongs_to :account, default: -> { board.account }
+  belongs_to :board
+  belongs_to :creator, class_name: "User"
+  belongs_to :eventable, polymorphic: true  # Card, Comment, etc.
+
+  after_create -> { eventable.event_was_created(self) }
+  after_create_commit :dispatch_webhooks
+end
+```
+
+### The Eventable Concern
+
+```ruby
+module Eventable
+  extend ActiveSupport::Concern
+
+  included do
+    has_many :events, as: :eventable, dependent: :destroy
+  end
+
+  def track_event(action, creator: Current.user, board: self.board, **particulars)
+    if should_track_event?
+      board.events.create!(
+        action: "#{eventable_prefix}_#{action}",
+        creator:, board:, eventable: self,
+        particulars:
+      )
+    end
+  end
+end
+```
+
+### Card-Specific Event Tracking
+
+```ruby
+module Card::Eventable
+  include ::Eventable
+
+  included do
+    after_save :track_title_change, if: :saved_change_to_title?
+  end
+
+  def event_was_created(event)
+    transaction do
+      create_system_comment_for(event)
+      touch_last_active_at unless was_just_published?
+    end
+  end
+
+  private
+    def track_title_change
+      if title_before_last_save.present?
+        track_event "title_changed", particulars: {
+          old_title: title_before_last_save,
+          new_title: title
+        }
+      end
+    end
+end
+```
+
+### Event Actions
+
+```ruby
+PERMITTED_ACTIONS = %w[
+  card_assigned
+  card_closed
+  card_postponed
+  card_auto_postponed
+  card_board_changed
+  card_published
+  card_reopened
+  card_sent_back_to_triage
+  card_triaged
+  card_unassigned
+  comment_created
+]
+```
+
+### Event Particulars (JSON metadata)
+
+```ruby
+module Event::Particulars
+  included do
+    store_accessor :particulars, :assignee_ids
+  end
+
+  def assignees
+    @assignees ||= User.where(id: assignee_ids)
+  end
+end
+
+# Usage
+track_event "title_changed", particulars: {
+  old_title: "Old",
+  new_title: "New"
+}
+```
+
+### Webhooks Driven by Events
+
+```ruby
+class Webhook < ApplicationRecord
+  PERMITTED_ACTIONS = %w[card_assigned card_closed ...]
+
+  has_many :deliveries, dependent: :delete_all
+  serialize :subscribed_actions, type: Array, coder: JSON
+
+  def for_slack?
+    url.match? %r{//hooks\.slack\.com/services/}i
+  end
+
+  def for_campfire?
+    url.match? %r{/rooms/\d+/\d+-[^\/]+/messages\Z}i
+  end
+end
+```
+
+---
+
+## PORO Patterns (Plain Old Ruby Objects)
+
+POROs are namespaced under their parent model:
+
+### Nested Under Model Namespace
+
+```
+app/models/
+├── event.rb
+├── event/
+│   ├── description.rb      # PORO
+│   ├── particulars.rb      # Concern
+│   └── promptable.rb       # Concern
+├── card.rb
+├── card/
+│   ├── eventable/
+│   │   └── system_commenter.rb  # PORO
+│   ├── closeable.rb        # Concern
+│   ├── golden.rb           # Concern
+│   └── goldness.rb         # ActiveRecord
+```
+
+### PORO for Presentation Logic
+
+```ruby
+class Event::Description
+  include ActionView::Helpers::TagHelper
+  include ERB::Util
+
+  attr_reader :event, :user
+
+  def initialize(event, user)
+    @event, @user = event, user
+  end
+
+  def to_html
+    to_sentence(creator_tag, card_title_tag).html_safe
+  end
+
+  def to_plain_text
+    to_sentence(creator_name, card.title)
+  end
+
+  private
+    def action_sentence(creator, card_title)
+      case event.action
+      when "card_closed"
+        %(#{creator} moved #{card_title} to "Done")
+      when "card_reopened"
+        "#{creator} reopened #{card_title}"
+      # ...
+      end
+    end
+end
+```
+
+### PORO for Business Logic
+
+```ruby
+class Card::Eventable::SystemCommenter
+  include ERB::Util
+
+  attr_reader :card, :event
+
+  def initialize(card, event)
+    @card, @event = card, event
+  end
+
+  def comment
+    return unless comment_body.present?
+    card.comments.create!(
+      creator: card.account.system_user,
+      body: comment_body,
+      created_at: event.created_at
+    )
+  end
+
+  private
+    def comment_body
+      case event.action
+      when "card_closed"
+        "<strong>Moved</strong> to "Done" by #{creator_name}"
+      # ...
+      end
+    end
+end
+```
+
+### PORO for View Context
+
+```ruby
+class User::Filtering
+  attr_reader :user, :filter, :expanded
+
+  delegate :as_params, :single_board, to: :filter
+
+  def initialize(user, filter, expanded: false)
+    @user, @filter, @expanded = user, filter, expanded
+  end
+
+  def boards
+    @boards ||= user.boards.ordered_by_recently_accessed
+  end
+
+  def cache_key
+    ActiveSupport::Cache.expand_cache_key(
+      [user, filter, expanded?, boards, tags, users, filters],
+      "user-filtering"
+    )
+  end
+end
+```
+
+### When to Use POROs
+
+1. **Presentation logic** - `Event::Description` formats events for display
+2. **Complex operations** - `SystemCommenter` creates comments from events
+3. **View context bundling** - `User::Filtering` collects filter UI state
+4. **NOT service objects** - POROs are model-adjacent, not controller-adjacent
+
+---
+
+## API Design Patterns
+
+### Same Controllers, Different Format
+
+```ruby
+def create
+  @comment = @card.comments.create!(comment_params)
+
+  respond_to do |format|
+    format.turbo_stream
+    format.json { head :created, location: card_comment_path(@card, @comment) }
+  end
+end
+```
+
+### Consistent Response Codes
+
+| Action | Success Code |
+|--------|--------------|
+| Create | `201 Created` + `Location` header |
+| Update | `204 No Content` |
+| Delete | `204 No Content` |
+
+### Bearer Token Authentication
+
+```ruby
+def authenticate_by_bearer_token
+  if token = request.authorization&.match(/^Bearer (.+)$/)&.[](1)
+    if access_token = AccessToken.find_by_token(token)
+      set_current_session_from_access_token(access_token)
+    end
+  end
+end
+```
+
+---
+
+## Error Handling & Validation
+
+### Minimal Validations
+
+```ruby
+class Account < ApplicationRecord
+  validates :name, presence: true  # That's it
+end
+
+class Identity < ApplicationRecord
+  validates :email_address, format: { with: URI::MailTo::EMAIL_REGEXP }
+end
+```
+
+### Contextual Validations
+
+```ruby
+class Signup
+  validates :email_address, format: { with: URI::MailTo::EMAIL_REGEXP }, on: :identity_creation
+  validates :full_name, :identity, presence: true, on: :completion
+end
+```
+
+### Let It Crash (Bang Methods)
+
+```ruby
+def create
+  @comment = @card.comments.create!(comment_params)  # Raises on failure
+end
+```
+
+---
+
+## Configuration & Environment
+
+### ENV Pattern: Fetch with Defaults
+
+```ruby
+# Use ENV.fetch with sensible defaults
+ENV.fetch("PORT", 3000)
+ENV.fetch("SMTP_PORT", "587").to_i
+ENV.fetch("MULTI_TENANT", "true")
+ENV.fetch("DATABASE_ADAPTER", saas? ? "mysql" : "sqlite")
+
+# Only use ENV[] (no default) for optional values
+ENV["MYSQL_PASSWORD"]
+ENV["VAPID_PRIVATE_KEY"]
+```
+
+### Database Configuration: Multiple Databases
+
+```yaml
+# config/database.mysql.yml
+default: &default
+  adapter: trilogy
+  host: <%= ENV.fetch("MYSQL_HOST", "127.0.0.1") %>
+  port: <%= ENV.fetch("MYSQL_PORT", "3306") %>
+  pool: 50
+  timeout: 5000
+
+production:
+  primary:
+    <<: *default
+    database: fizzy_production
+  cable:
+    <<: *default
+    database: fizzy_production_cable
+  queue:
+    <<: *default
+    database: fizzy_production_queue
+  cache:
+    <<: *default
+    database: fizzy_production_cache
+```
+
+Separate databases for:
+- **Primary** - Main app data
+- **Cable** - ActionCable/WebSocket messages
+- **Queue** - Solid Queue jobs
+- **Cache** - Solid Cache data
+
+### SQLite for Simple Deployments
+
+```yaml
+# config/database.sqlite.yml
+production:
+  primary:
+    adapter: sqlite3
+    database: storage/production.sqlite3
+    pool: 5
+```
+
+### Dynamic Database Selection
+
+```ruby
+# lib/fizzy.rb
+module Fizzy
+  def db_adapter
+    @db_adapter ||= DbAdapter.new ENV.fetch("DATABASE_ADAPTER", saas? ? "mysql" : "sqlite")
+  end
+end
+
+# config/database.yml
+<%= ERB.new(File.read("config/database.#{Fizzy.db_adapter}.yml")).result %>
+```
+
+### Minimal Logging
+
+Almost no explicit logging in app code:
+
+```ruby
+# Only 2 logging calls in entire app/models:
+Rails.logger.error error
+Rails.logger.error error.backtrace.join("\n")
+```
+
+Let Rails handle logging. Don't litter code with log statements.
+
+### Configuration via Initializers
+
+```ruby
+# config/initializers/multi_tenant.rb
+Rails.application.configure do
+  config.after_initialize do
+    Account.multi_tenant = ENV["MULTI_TENANT"] == "true" || config.x.multi_tenant.enabled == true
+  end
+end
+```
+
+### Important ENV Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DATABASE_ADAPTER` | `sqlite`/`mysql` | Database type |
+| `MULTI_TENANT` | `true` | Enable multi-tenancy |
+| `SMTP_ADDRESS` | - | SMTP server |
+| `MAILER_FROM_ADDRESS` | `support@fizzy.do` | From address |
+| `ACTIVE_STORAGE_SERVICE` | `local` | Storage backend |
+| `DISABLE_SSL` | `false` | Disable SSL in prod |
+| `SOLID_QUEUE_IN_PUMA` | - | Run jobs in web process |
+
+---
+
+## Mailer Patterns
+
+### Minimal Mailers
+
+```ruby
+class MagicLinkMailer < ApplicationMailer
+  def sign_in_instructions(magic_link)
+    @magic_link = magic_link
+    @identity = @magic_link.identity
+    mail to: @identity.email_address,
+         subject: "Your Fizzy code is #{@magic_link.code}"
+  end
+end
+```
+
+### Bundled Notifications
+
+```ruby
+# config/recurring.yml
+deliver_bundled_notifications:
+  command: "Notification::Bundle.deliver_all_later"
+  schedule: every 30 minutes
+```
 
 ---
 
